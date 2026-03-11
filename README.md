@@ -23,6 +23,45 @@ codexmux serve   # → https://localhost:8844
 
 ---
 
+## Example: Parallel Feature Development
+
+Spin up two agents — one for the API, one for the frontend — with a shared task board so they don't step on each other.
+
+```bash
+# Register agents pointed at the same repo
+codexmux register api      --dir ~/myapp --full-auto --model o3
+codexmux register frontend --dir ~/myapp --full-auto --model o3
+
+# Seed the task board
+codexmux board add --title "Build POST /auth/login endpoint"   --project API
+codexmux board add --title "Build POST /auth/register endpoint" --project API
+codexmux board add --title "Create login page component"       --project UI
+codexmux board add --title "Create signup page component"      --project UI
+
+# Launch both agents
+codexmux start api
+codexmux start frontend
+
+# Open the dashboard to watch them work
+codexmux serve
+```
+
+From the dashboard (or CLI), each agent claims tasks atomically — no duplicated work. Peek into either session live, send follow-up prompts, and let the watchdog handle crashes.
+
+```bash
+# Check on progress
+codexmux peek api
+codexmux peek frontend
+
+# Send a directive to the api agent
+codexmux send api "use bcrypt for password hashing, not argon2"
+
+# See what's been claimed
+codexmux board list
+```
+
+---
+
 ## Features
 
 - **Parallel agents** — register and run many `codex` sessions, each in tmux
