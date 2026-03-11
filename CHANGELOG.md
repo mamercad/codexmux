@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-10
+
+### Added
+
+- `update` command (alias: `set`) for partial session updates — change `--dir`, `--full-auto`, `--no-full-auto`, `--model`, `--sandbox` without re-registering
+- `rm` command (aliases: `remove`, `del`) to delete sessions — stops tmux if running, cleans up messages, alerts, and task assignments
+- Auto-trust directories in `~/.codex/config.toml` on `register` to prevent the codex trust prompt from blocking sessions
+- `tmux_new_session` now passes `-c <cwd>` so sessions start in the correct directory
+- `cmd_attach` pre-checks tmux session existence with a helpful error message
+
+### Fixed
+
+- Watchdog restart now passes `cwd` to `tmux_new_session` for consistency
+- Sessions no longer silently die due to codex trust prompt in untrusted directories
+
 ## [0.1.0] - 2026-03-10
 
 ### Added
@@ -33,5 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Use `codex` binary with `--no-alt-screen` for tmux compatibility
 - Pass tmux commands as single shell string via `shlex.quote`
 
-[Unreleased]: https://github.com/mamercad/codexmux/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mamercad/codexmux/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mamercad/codexmux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mamercad/codexmux/releases/tag/v0.1.0

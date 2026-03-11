@@ -129,14 +129,14 @@ def tmux_has_session(name: str) -> bool:
     return cp.returncode == 0
 
 
-def tmux_new_session(name: str, cmd: list[str]) -> None:
+def tmux_new_session(name: str, cmd: list[str], cwd: str | None = None) -> None:
     sn = tmux_session_name(name)
     joined = " ".join(shlex.quote(c) for c in cmd)
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", sn, joined],
-        check=True,
-        capture_output=True,
-    )
+    tmux_cmd = ["tmux", "new-session", "-d", "-s", sn]
+    if cwd:
+        tmux_cmd.extend(["-c", cwd])
+    tmux_cmd.append(joined)
+    subprocess.run(tmux_cmd, check=True, capture_output=True)
 
 
 def tmux_kill_session(name: str) -> None:
@@ -287,6 +287,21 @@ def resolve_name(name: str) -> str:
     raise SystemExit(f"Session '{name}' not found")
 
 
+def _ensure_codex_trust(directory: str) -> None:
+    """Add directory to ~/.codex/config.toml as trusted if not already present."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("")
+    content = config_path.read_text()
+    section_header = f'[projects."{directory}"]'
+    if section_header in content:
+        return
+    entry = f'\n{section_header}\ntrust_level = "trusted"\n'
+    config_path.write_text(content.rstrip() + "\n" + entry)
+    LOG.info("Auto-trusted directory in codex config: %s", directory)
+
+
 def cmd_register(args: argparse.Namespace) -> dict[str, Any]:
     conn = _db()
     name = args.name
@@ -307,6 +322,7 @@ def cmd_register(args: argparse.Namespace) -> dict[str, Any]:
         (name, directory, full_auto, model, sandbox, "stopped", now, now),
     )
     conn.commit()
+    _ensure_codex_trust(directory)
     print(f"Registered session: {name}")
     return {"name": name, "directory": directory}
 
@@ -340,7 +356,7 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     if prompt:
         cmd.append(prompt)
 
-    tmux_new_session(name, cmd)
+    tmux_new_session(name, cmd, cwd=row["directory"])
     now = _now()
     conn.execute(
         "UPDATE sessions SET status='running', updated_at=? WHERE name=?",
@@ -365,8 +381,65 @@ def cmd_stop(args: argparse.Namespace) -> dict[str, Any]:
     return {"name": name, "status": "stopped"}
 
 
+def cmd_update(args: argparse.Namespace) -> dict[str, Any]:
+    name = resolve_name(args.name)
+    conn = _db()
+    row = _row_dict(conn.execute("SELECT * FROM sessions WHERE name = ?", (name,)).fetchone())
+    if row is None:
+        raise SystemExit(f"Session '{name}' not found")
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if args.dir is not None:
+        directory = os.path.abspath(args.dir)
+        updates.append("directory = ?")
+        params.append(directory)
+        _ensure_codex_trust(directory)
+    if args.full_auto is not None:
+        updates.append("full_auto = ?")
+        params.append(1 if args.full_auto else 0)
+    if args.no_full_auto:
+        updates.append("full_auto = ?")
+        params.append(0)
+    if args.model is not None:
+        updates.append("model = ?")
+        params.append(args.model)
+    if args.sandbox is not None:
+        updates.append("sandbox = ?")
+        params.append(args.sandbox)
+
+    if not updates:
+        print(f"Nothing to update for '{name}'")
+        return {"name": name, "status": "unchanged"}
+
+    updates.append("updated_at = ?")
+    params.append(_now())
+    params.append(name)
+    conn.execute(f"UPDATE sessions SET {', '.join(updates)} WHERE name = ?", params)
+    conn.commit()
+    changed = ", ".join(u.split(" =")[0] for u in updates if u != "updated_at = ?")
+    print(f"Updated '{name}': {changed}")
+    return {"name": name, "status": "updated"}
+
+
+def cmd_rm(args: argparse.Namespace) -> dict[str, Any]:
+    name = resolve_name(args.name)
+    conn = _db()
+    if tmux_has_session(name):
+        tmux_kill_session(name)
+    conn.execute("DELETE FROM messages WHERE session = ?", (name,))
+    conn.execute("DELETE FROM alerts WHERE session = ?", (name,))
+    conn.execute("UPDATE tasks SET assignee = NULL WHERE assignee = ?", (name,))
+    conn.execute("DELETE FROM sessions WHERE name = ?", (name,))
+    conn.commit()
+    print(f"Removed session: {name}")
+    return {"name": name, "status": "removed"}
+
+
 def cmd_attach(args: argparse.Namespace) -> None:
     name = resolve_name(args.name)
+    if not tmux_has_session(name):
+        raise SystemExit(f"Session '{name}' is not running — start it first: codexmux start {name}")
     sn = tmux_session_name(name)
     os.execvp("tmux", ["tmux", "attach-session", "-t", sn])
 
@@ -541,7 +614,7 @@ def watchdog_tick() -> None:
             if row.get("sandbox"):
                 resume_cmd.extend(["--sandbox", row["sandbox"]])
             tmux_kill_session(name)
-            tmux_new_session(name, resume_cmd)
+            tmux_new_session(name, resume_cmd, cwd=row["directory"])
             _last_activity[name] = now_ts
             _waiting_since.pop(name, None)
             continue
@@ -1335,9 +1408,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("name")
     p_start.add_argument("--prompt", default=None)
 
+    # update
+    p_upd = sub.add_parser("update", aliases=["set"], help="Update session settings")
+    p_upd.add_argument("name")
+    p_upd.add_argument("--dir", default=None, help="Change working directory")
+    p_upd.add_argument("--full-auto", action="store_true", default=None, help="Enable full-auto")
+    p_upd.add_argument("--no-full-auto", action="store_true", default=False, help="Disable full-auto")
+    p_upd.add_argument("--model", default=None, help="Change model")
+    p_upd.add_argument("--sandbox", default=None, help="Change sandbox mode")
+
     # stop
     p_stop = sub.add_parser("stop", help="Stop a session")
     p_stop.add_argument("name")
+
+    # rm
+    p_rm = sub.add_parser("rm", aliases=["remove", "del"], help="Remove a session")
+    p_rm.add_argument("name")
 
     # attach
     p_attach = sub.add_parser("attach", help="Attach to a session")
@@ -1405,8 +1491,13 @@ def main() -> None:
 
     dispatch = {
         "register": cmd_register,
+        "update": cmd_update,
+        "set": cmd_update,
         "start": cmd_start,
         "stop": cmd_stop,
+        "rm": cmd_rm,
+        "remove": cmd_rm,
+        "del": cmd_rm,
         "attach": cmd_attach,
         "peek": cmd_peek,
         "send": cmd_send,

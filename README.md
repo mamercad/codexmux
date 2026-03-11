@@ -114,9 +114,11 @@ codexmux serve   # → https://localhost:8844
 ## CLI
 
 ```bash
-codexmux register <name> --dir <path> [--full-auto] [--model o4-mini] [--worktree]
-codexmux start <name>
+codexmux register <name> --dir <path> [--full-auto] [--model o4-mini] [--sandbox MODE]
+codexmux update <name> [--dir <path>] [--full-auto] [--no-full-auto] [--model M] [--sandbox MODE]
+codexmux start <name> [--prompt "..."]
 codexmux stop <name>
+codexmux rm <name>              # remove session (stops if running, cleans up DB)
 codexmux attach <name>          # attach to tmux session (detach: Ctrl-b d)
 codexmux peek <name>            # view output without attaching
 codexmux send <name> <text>     # send text to a session
