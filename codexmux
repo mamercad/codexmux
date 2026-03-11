@@ -1,0 +1,1428 @@
+#!/usr/bin/env python3
+"""codexmux — Codex CLI Multiplexer. Zero-dependency, single-file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import shlex
+import sqlite3
+import ssl
+import subprocess
+import textwrap
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+DATA_DIR = Path.home() / ".codexmux"
+DB_PATH = DATA_DIR / "codexmux.db"
+DEFAULT_PORT = 8844
+TMUX_PREFIX = "codexmux-"
+
+LOG = logging.getLogger("codexmux")
+
+_local = threading.local()
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+
+def _db() -> sqlite3.Connection:
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        _init_schema(conn)
+        _local.conn = conn
+    return conn
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            name        TEXT PRIMARY KEY,
+            directory   TEXT NOT NULL,
+            full_auto   INTEGER NOT NULL DEFAULT 0,
+            model       TEXT,
+            sandbox     TEXT,
+            pid         INTEGER,
+            status      TEXT NOT NULL DEFAULT 'stopped',
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            id          TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'todo',
+            assignee    TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session     TEXT NOT NULL,
+            role        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS alerts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            type        TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            session     TEXT,
+            created_at  TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _rows_list(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Tmux helpers
+# ---------------------------------------------------------------------------
+
+
+def tmux_session_name(name: str) -> str:
+    return f"{TMUX_PREFIX}{name}"
+
+
+def tmux_has_session(name: str) -> bool:
+    sn = tmux_session_name(name)
+    cp = subprocess.run(
+        ["tmux", "has-session", "-t", sn],
+        capture_output=True,
+    )
+    return cp.returncode == 0
+
+
+def tmux_new_session(name: str, cmd: list[str]) -> None:
+    sn = tmux_session_name(name)
+    joined = " ".join(shlex.quote(c) for c in cmd)
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", sn, joined],
+        check=True,
+        capture_output=True,
+    )
+
+
+def tmux_kill_session(name: str) -> None:
+    sn = tmux_session_name(name)
+    subprocess.run(
+        ["tmux", "kill-session", "-t", sn],
+        capture_output=True,
+    )
+
+
+def tmux_send_keys(name: str, keys: str) -> None:
+    sn = tmux_session_name(name)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", sn, keys, "Enter"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def tmux_capture(name: str, lines: int = 200) -> str:
+    sn = tmux_session_name(name)
+    cp = subprocess.run(
+        ["tmux", "capture-pane", "-t", sn, "-p", "-S", f"-{lines}"],
+        capture_output=True,
+        text=True,
+    )
+    return cp.stdout if cp.returncode == 0 else ""
+
+
+def tmux_list() -> list[str]:
+    cp = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+    )
+    if cp.returncode != 0:
+        return []
+    return [ln.removeprefix(TMUX_PREFIX) for ln in cp.stdout.strip().splitlines() if ln.startswith(TMUX_PREFIX)]
+
+
+# ---------------------------------------------------------------------------
+# Status detection
+# ---------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _at_shell_prompt(line: str) -> bool:
+    stripped = line.rstrip()
+    return bool(stripped) and stripped[-1] in ("$", "%", "#")
+
+
+_APPROVAL_PATTERNS = [
+    "approve",
+    "allow",
+    "permit",
+    "yes/no",
+    "y/n",
+    "press enter",
+    "confirm",
+    "accept",
+    "do you want to",
+    "proceed",
+]
+
+_ERROR_PATTERNS = ["traceback", "error:", "fatal:", "exception:", "panic:"]
+
+_WORKING_PATTERNS = [
+    "thinking",
+    "generating",
+    "writing",
+    "reading",
+    "running",
+    "searching",
+    "executing",
+    "analyzing",
+]
+
+
+def _detect_status(output: str) -> str:
+    if not output or not output.strip():
+        return "unknown"
+
+    clean = _strip_ansi(output)
+    lines = clean.strip().splitlines()
+    if not lines:
+        return "unknown"
+
+    tail = "\n".join(lines[-30:]).lower()
+    last_line = lines[-1].strip()
+
+    if _at_shell_prompt(last_line):
+        return "exited"
+
+    for pat in _APPROVAL_PATTERNS:
+        if pat in tail:
+            return "waiting"
+
+    for pat in _ERROR_PATTERNS:
+        if pat in tail:
+            return "error"
+
+    for pat in _WORKING_PATTERNS:
+        if pat in tail:
+            return "working"
+
+    if last_line:
+        return "idle"
+
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------------------
+
+
+def _push_alert(alert_type: str, message: str, session: str | None = None) -> None:
+    conn = _db()
+    conn.execute(
+        "INSERT INTO alerts (type, message, session, created_at) VALUES (?,?,?,?)",
+        (alert_type, message, session, _now()),
+    )
+    conn.commit()
+    LOG.info("alert [%s] %s: %s", alert_type, session or "-", message)
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+
+def resolve_name(name: str) -> str:
+    conn = _db()
+    row = conn.execute("SELECT name FROM sessions WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row["name"]
+    rows = conn.execute("SELECT name FROM sessions WHERE name LIKE ?", (f"{name}%",)).fetchall()
+    if len(rows) == 1:
+        return rows[0]["name"]
+    if len(rows) > 1:
+        names = ", ".join(r["name"] for r in rows)
+        raise SystemExit(f"Ambiguous name '{name}', matches: {names}")
+    raise SystemExit(f"Session '{name}' not found")
+
+
+def cmd_register(args: argparse.Namespace) -> dict[str, Any]:
+    conn = _db()
+    name = args.name
+    directory = os.path.abspath(args.dir or os.getcwd())
+    full_auto = 1 if args.full_auto else 0
+    model = getattr(args, "model", None)
+    sandbox = getattr(args, "sandbox", None)
+    now = _now()
+    conn.execute(
+        """INSERT INTO sessions (name, directory, full_auto, model, sandbox, status, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(name) DO UPDATE SET
+             directory=excluded.directory,
+             full_auto=excluded.full_auto,
+             model=excluded.model,
+             sandbox=excluded.sandbox,
+             updated_at=excluded.updated_at""",
+        (name, directory, full_auto, model, sandbox, "stopped", now, now),
+    )
+    conn.commit()
+    print(f"Registered session: {name}")
+    return {"name": name, "directory": directory}
+
+
+def _build_codex_cmd(row: dict[str, Any]) -> list[str]:
+    cmd = ["codex"]
+    if row.get("full_auto"):
+        cmd.extend(["--full-auto"])
+    if row.get("model"):
+        cmd.extend(["--model", row["model"]])
+    cmd.append("--no-alt-screen")
+    if row.get("sandbox"):
+        cmd.extend(["--sandbox", row["sandbox"]])
+    cmd.extend(["--cd", row["directory"]])
+    return cmd
+
+
+def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
+    name = resolve_name(args.name)
+    conn = _db()
+    row = _row_dict(conn.execute("SELECT * FROM sessions WHERE name = ?", (name,)).fetchone())
+    if row is None:
+        raise SystemExit(f"Session '{name}' not found")
+
+    if tmux_has_session(name):
+        print(f"Session '{name}' is already running")
+        return {"name": name, "status": "already_running"}
+
+    cmd = _build_codex_cmd(row)
+    prompt = getattr(args, "prompt", None)
+    if prompt:
+        cmd.append(prompt)
+
+    tmux_new_session(name, cmd)
+    now = _now()
+    conn.execute(
+        "UPDATE sessions SET status='running', updated_at=? WHERE name=?",
+        (now, name),
+    )
+    conn.commit()
+    print(f"Started session: {name}")
+    return {"name": name, "status": "running"}
+
+
+def cmd_stop(args: argparse.Namespace) -> dict[str, Any]:
+    name = resolve_name(args.name)
+    conn = _db()
+    tmux_kill_session(name)
+    now = _now()
+    conn.execute(
+        "UPDATE sessions SET status='stopped', updated_at=? WHERE name=?",
+        (now, name),
+    )
+    conn.commit()
+    print(f"Stopped session: {name}")
+    return {"name": name, "status": "stopped"}
+
+
+def cmd_attach(args: argparse.Namespace) -> None:
+    name = resolve_name(args.name)
+    sn = tmux_session_name(name)
+    os.execvp("tmux", ["tmux", "attach-session", "-t", sn])
+
+
+def cmd_peek(args: argparse.Namespace) -> dict[str, Any]:
+    name = resolve_name(args.name)
+    output = tmux_capture(name)
+    status = _detect_status(output)
+    conn = _db()
+    conn.execute(
+        "UPDATE sessions SET status=?, updated_at=? WHERE name=?",
+        (status, _now(), name),
+    )
+    conn.commit()
+    if not getattr(args, "json_output", False):
+        print(output)
+    return {"name": name, "status": status, "output": output}
+
+
+def cmd_send(args: argparse.Namespace) -> dict[str, Any]:
+    name = resolve_name(args.name)
+    text = args.text
+    tmux_send_keys(name, text)
+    conn = _db()
+    conn.execute(
+        "INSERT INTO messages (session, role, content, created_at) VALUES (?,?,?,?)",
+        (name, "user", text, _now()),
+    )
+    conn.commit()
+    print(f"Sent to '{name}': {text}")
+    return {"name": name, "sent": text}
+
+
+def cmd_ls(args: argparse.Namespace) -> list[dict[str, Any]]:
+    conn = _db()
+    rows = _rows_list(conn.execute("SELECT * FROM sessions ORDER BY name").fetchall())
+    live = set(tmux_list())
+    for row in rows:
+        row["live"] = row["name"] in live
+
+    fmt = getattr(args, "format", "text")
+    if fmt == "json":
+        print(json.dumps(rows, indent=2))
+    else:
+        if not rows:
+            print("No sessions registered.")
+        else:
+            for row in rows:
+                fa = " [full-auto]" if row.get("full_auto") else ""
+                lv = " (live)" if row.get("live") else ""
+                mdl = f" model={row['model']}" if row.get("model") else ""
+                sb = f" sandbox={row['sandbox']}" if row.get("sandbox") else ""
+                print(f"  {row['name']}: {row['status']}{fa}{mdl}{sb}{lv}")
+    return rows
+
+
+def cmd_exec(args: argparse.Namespace) -> dict[str, Any]:
+    cmd_register(args)
+    result = cmd_start(args)
+    prompt = getattr(args, "prompt", None)
+    if prompt and not args.prompt:
+        pass
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Task board
+# ---------------------------------------------------------------------------
+
+
+def _short_id() -> str:
+    return hashlib.sha256(uuid.uuid4().bytes).hexdigest()[:8]
+
+
+def cmd_board(args: argparse.Namespace) -> Any:
+    sub = args.board_action
+    conn = _db()
+
+    if sub == "add":
+        tid = _short_id()
+        now = _now()
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (?,?,?,?,?)",
+            (tid, args.title, "todo", now, now),
+        )
+        conn.commit()
+        print(f"Added task {tid}: {args.title}")
+        return {"id": tid, "title": args.title}
+
+    if sub == "claim":
+        tid = args.id
+        assignee = args.assignee
+        now = _now()
+        conn.execute(
+            "UPDATE tasks SET status='claimed', assignee=?, updated_at=? WHERE id=?",
+            (assignee, now, tid),
+        )
+        conn.commit()
+        print(f"Task {tid} claimed by {assignee}")
+        return {"id": tid, "assignee": assignee}
+
+    if sub == "done":
+        tid = args.id
+        now = _now()
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
+            (now, tid),
+        )
+        conn.commit()
+        print(f"Task {tid} marked done")
+        return {"id": tid, "status": "done"}
+
+    if sub == "list":
+        rows = _rows_list(conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall())
+        fmt = getattr(args, "format", "text")
+        if fmt == "json":
+            print(json.dumps(rows, indent=2))
+        else:
+            for row in rows:
+                a = f" ({row['assignee']})" if row.get("assignee") else ""
+                print(f"  [{row['status']:>7}] {row['id']} {row['title']}{a}")
+        return rows
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Watchdog
+# ---------------------------------------------------------------------------
+
+_IDLE_THRESHOLD = 600  # 10 min
+_APPROVAL_GRACE = 30  # 30 sec
+
+_last_activity: dict[str, float] = {}
+_waiting_since: dict[str, float] = {}
+
+
+def watchdog_tick() -> None:
+    conn = _db()
+    rows = conn.execute("SELECT * FROM sessions WHERE status != 'stopped'").fetchall()
+
+    for row in rows:
+        row = dict(row)
+        name = row["name"]
+
+        if not tmux_has_session(name):
+            conn.execute(
+                "UPDATE sessions SET status='stopped', updated_at=? WHERE name=?",
+                (_now(), name),
+            )
+            conn.commit()
+            continue
+
+        output = tmux_capture(name, lines=80)
+        status = _detect_status(output)
+        conn.execute(
+            "UPDATE sessions SET status=?, updated_at=? WHERE name=?",
+            (status, _now(), name),
+        )
+        conn.commit()
+
+        now_ts = time.time()
+
+        if status == "exited" and row.get("full_auto"):
+            _push_alert("auto-restart", f"Session '{name}' exited, restarting", name)
+            resume_cmd = ["codex", "resume", "--last"]
+            resume_cmd.extend(["--cd", row["directory"]])
+            resume_cmd.append("--full-auto")
+            resume_cmd.append("--no-alt-screen")
+            if row.get("model"):
+                resume_cmd.extend(["--model", row["model"]])
+            if row.get("sandbox"):
+                resume_cmd.extend(["--sandbox", row["sandbox"]])
+            tmux_kill_session(name)
+            tmux_new_session(name, resume_cmd)
+            _last_activity[name] = now_ts
+            _waiting_since.pop(name, None)
+            continue
+
+        if status == "waiting" and row.get("full_auto"):
+            started = _waiting_since.get(name)
+            if started is None:
+                _waiting_since[name] = now_ts
+            elif now_ts - started >= _APPROVAL_GRACE:
+                _push_alert(
+                    "auto-accept",
+                    f"Auto-accepting approval for '{name}'",
+                    name,
+                )
+                tmux_send_keys(name, "y")
+                _waiting_since.pop(name, None)
+                _last_activity[name] = now_ts
+            continue
+
+        _waiting_since.pop(name, None)
+
+        if status in ("working", "idle"):
+            last = _last_activity.get(name, now_ts)
+            if status == "working":
+                _last_activity[name] = now_ts
+            elif now_ts - last > _IDLE_THRESHOLD:
+                _push_alert("stuck", f"Session '{name}' idle >10min", name)
+                _last_activity[name] = now_ts
+        else:
+            _last_activity[name] = now_ts
+
+
+def watchdog_loop(interval: float = 10.0) -> None:
+    while True:
+        try:
+            watchdog_tick()
+        except Exception:
+            LOG.exception("watchdog error")
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Web Dashboard
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = textwrap.dedent(
+    """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>codexmux</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e14;
+  --surface: #111820;
+  --surface2: #1a2230;
+  --border: #1e2a38;
+  --text: #c8d0d8;
+  --text-dim: #5a6a78;
+  --accent: #10a37f;
+  --accent2: #1ae5be;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --red: #ef4444;
+  --orange: #f97316;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+a { color: var(--accent2); text-decoration: none; }
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 2rem;
+  border-bottom: 1px solid var(--border);
+}
+.logo {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.5rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.version { color: var(--text-dim); font-size: .8rem; margin-left: .5rem; }
+.tabs {
+  display: flex;
+  gap: .5rem;
+  padding: .5rem 2rem;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  padding: .5rem 1rem;
+  cursor: pointer;
+  border-radius: 6px;
+  font-size: .9rem;
+  font-weight: 500;
+  color: var(--text-dim);
+  border: none;
+  background: none;
+  transition: all .2s;
+}
+.tab:hover { color: var(--text); background: var(--surface); }
+.tab.active { color: var(--accent2); background: var(--surface2); }
+.panel { display: none; padding: 1.5rem 2rem; }
+.panel.active { display: block; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1rem; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.2rem;
+}
+.card-head { display: flex; align-items: center; gap: .6rem; margin-bottom: .6rem; }
+.card-name { font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 1rem; }
+.dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+}
+.dot.working { background: var(--accent2); animation: pulse 1.5s infinite; }
+.dot.running { background: var(--green); }
+.dot.waiting { background: var(--yellow); }
+.dot.error { background: var(--red); }
+.dot.stopped, .dot.exited { background: var(--text-dim); }
+.dot.idle { background: var(--orange); }
+.dot.unknown { background: var(--text-dim); }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+.flags { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
+.flag {
+  font-size: .7rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--surface2);
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+.card-actions { display: flex; gap: .4rem; }
+.btn {
+  padding: .35rem .8rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  font-size: .8rem;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  transition: all .2s;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent2); }
+.btn.danger:hover { border-color: var(--red); color: var(--red); }
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.7);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 90vw;
+  max-width: 900px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-head {
+  padding: 1rem 1.2rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 1.2rem;
+}
+.term-output {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .8rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  line-height: 1.5;
+}
+.send-bar {
+  display: flex;
+  gap: .5rem;
+  padding: 1rem 1.2rem;
+  border-top: 1px solid var(--border);
+}
+.send-bar input {
+  flex: 1;
+  padding: .5rem .8rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .85rem;
+  outline: none;
+}
+.send-bar input:focus { border-color: var(--accent); }
+.kanban { display: flex; gap: 1rem; min-height: 300px; }
+.kanban-col { flex: 1; background: var(--surface); border-radius: 10px; border: 1px solid var(--border); padding: 1rem; }
+.kanban-title {
+  font-weight: 700;
+  font-size: .85rem;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: .8rem;
+  letter-spacing: .05em;
+}
+.task-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: .6rem .8rem;
+  margin-bottom: .5rem;
+  font-size: .85rem;
+}
+.task-id { font-family: 'JetBrains Mono', monospace; color: var(--text-dim); font-size: .7rem; }
+.add-bar {
+  display: flex;
+  gap: .5rem;
+  margin-bottom: 1rem;
+}
+.add-bar input {
+  flex: 1;
+  padding: .5rem .8rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: .85rem;
+  outline: none;
+}
+.add-bar input:focus { border-color: var(--accent); }
+.alert-item {
+  display: flex;
+  gap: 1rem;
+  padding: .8rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: .5rem;
+  font-size: .85rem;
+}
+.alert-time { color: var(--text-dim); font-family: 'JetBrains Mono', monospace; font-size: .75rem; white-space: nowrap; }
+.alert-type { font-weight: 600; min-width: 90px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div><span class="logo">codexmux</span><span class="version">v"""
+    + VERSION
+    + """</span></div>
+</div>
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('sessions')">Sessions</button>
+  <button class="tab" onclick="switchTab('board')">Board</button>
+  <button class="tab" onclick="switchTab('alerts')">Alerts</button>
+</div>
+<div id="panel-sessions" class="panel active">
+  <div id="session-cards" class="cards"></div>
+</div>
+<div id="panel-board" class="panel">
+  <div class="add-bar">
+    <input id="task-input" placeholder="New task..." onkeydown="if(event.key==='Enter')addTask()">
+    <button class="btn" onclick="addTask()">Add</button>
+  </div>
+  <div class="kanban">
+    <div class="kanban-col"><div class="kanban-title">Todo</div><div id="col-todo"></div></div>
+    <div class="kanban-col"><div class="kanban-title">Claimed</div><div id="col-claimed"></div></div>
+    <div class="kanban-col"><div class="kanban-title">Done</div><div id="col-done"></div></div>
+  </div>
+</div>
+<div id="panel-alerts" class="panel">
+  <div id="alerts-list"></div>
+</div>
+<div class="modal-overlay" id="peek-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="peek-title" class="card-name"></span>
+      <button class="btn" onclick="closePeek()">Close</button>
+    </div>
+    <div class="modal-body"><pre class="term-output" id="peek-output"></pre></div>
+    <div class="send-bar">
+      <input id="peek-send" placeholder="Send text..." onkeydown="if(event.key==='Enter')sendToPeek()">
+      <button class="btn" onclick="sendToPeek()">Send</button>
+    </div>
+  </div>
+</div>
+<script>
+const BASE = '';
+let peekName = null;
+let peekTimer = null;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelector('.tab[onclick*="'+name+'"]').classList.add('active');
+  document.getElementById('panel-'+name).classList.add('active');
+}
+
+async function api(path, opts) {
+  const r = await fetch(BASE + path, opts);
+  return r.json();
+}
+
+async function loadSessions() {
+  const ss = await api('/api/sessions');
+  const el = document.getElementById('session-cards');
+  el.innerHTML = ss.map(s => {
+    const flags = [];
+    if (s.full_auto) flags.push('full-auto');
+    if (s.model) flags.push('model='+s.model);
+    if (s.sandbox) flags.push('sandbox='+s.sandbox);
+    return '<div class="card">'+
+      '<div class="card-head"><div class="dot '+s.status+'"></div><span class="card-name">'+s.name+'</span><span style="color:var(--text-dim);font-size:.8rem;margin-left:auto">'+s.status+'</span></div>'+
+      '<div class="flags">'+flags.map(f=>'<span class="flag">'+f+'</span>').join('')+'</div>'+
+      '<div class="card-actions">'+
+        '<button class="btn" onclick="openPeek(\''+s.name+'\')">Peek</button>'+
+        (s.status==='stopped'?'<button class="btn" onclick="startSession(\''+s.name+'\')">Start</button>':'')+
+        (s.status!=='stopped'?'<button class="btn danger" onclick="stopSession(\''+s.name+'\')">Stop</button>':'')+
+      '</div></div>';
+  }).join('');
+}
+
+async function startSession(n) { await api('/api/sessions/'+n+'/start', {method:'POST'}); loadSessions(); }
+async function stopSession(n) { await api('/api/sessions/'+n+'/stop', {method:'POST'}); loadSessions(); }
+
+async function openPeek(n) {
+  peekName = n;
+  document.getElementById('peek-title').textContent = n;
+  document.getElementById('peek-modal').classList.add('active');
+  refreshPeek();
+  peekTimer = setInterval(refreshPeek, 3000);
+}
+
+function closePeek() {
+  document.getElementById('peek-modal').classList.remove('active');
+  peekName = null;
+  if (peekTimer) { clearInterval(peekTimer); peekTimer = null; }
+}
+
+async function refreshPeek() {
+  if (!peekName) return;
+  const d = await api('/api/sessions/'+peekName+'/peek');
+  document.getElementById('peek-output').textContent = d.output || '';
+  const el = document.querySelector('.modal-body');
+  el.scrollTop = el.scrollHeight;
+}
+
+async function sendToPeek() {
+  const inp = document.getElementById('peek-send');
+  const text = inp.value.trim();
+  if (!text || !peekName) return;
+  await api('/api/sessions/'+peekName+'/send', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({text})
+  });
+  inp.value = '';
+  setTimeout(refreshPeek, 500);
+}
+
+async function loadTasks() {
+  const tasks = await api('/api/tasks');
+  ['todo','claimed','done'].forEach(st => {
+    const col = document.getElementById('col-'+st);
+    col.innerHTML = tasks.filter(t=>t.status===st).map(t =>
+      '<div class="task-card"><div class="task-id">'+t.id+'</div>'+t.title+'</div>'
+    ).join('');
+  });
+}
+
+async function addTask() {
+  const inp = document.getElementById('task-input');
+  const title = inp.value.trim();
+  if (!title) return;
+  await api('/api/tasks', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({title})
+  });
+  inp.value = '';
+  loadTasks();
+}
+
+async function loadAlerts() {
+  const alerts = await api('/api/alerts');
+  const el = document.getElementById('alerts-list');
+  el.innerHTML = alerts.map(a =>
+    '<div class="alert-item"><span class="alert-time">'+a.created_at.replace('T',' ').slice(0,19)+'</span><span class="alert-type">'+a.type+'</span><span>'+a.message+'</span></div>'
+  ).join('') || '<div style="color:var(--text-dim)">No alerts.</div>';
+}
+
+function refresh() { loadSessions(); loadTasks(); loadAlerts(); }
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+)
+
+
+# ---------------------------------------------------------------------------
+# REST API
+# ---------------------------------------------------------------------------
+
+
+class APIHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *fmt_args: Any) -> None:
+        LOG.debug(fmt, *fmt_args)
+
+    def _cors(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _json(self, data: Any, status: int = 200) -> None:
+        body = json.dumps(data, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, html: str) -> None:
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length))
+
+    def _route(self) -> tuple[str, list[str]]:
+        path = self.path.split("?")[0].rstrip("/")
+        parts = [p for p in path.split("/") if p]
+        return path, parts
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        path, parts = self._route()
+        conn = _db()
+
+        if path == "" or path == "/":
+            self._html(DASHBOARD_HTML)
+            return
+
+        if path == "/api/sessions":
+            rows = _rows_list(conn.execute("SELECT * FROM sessions ORDER BY name").fetchall())
+            self._json(rows)
+            return
+
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "sessions":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            row = _row_dict(conn.execute("SELECT * FROM sessions WHERE name = ?", (name,)).fetchone())
+            self._json(row)
+            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "peek":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            output = tmux_capture(name)
+            status = _detect_status(output)
+            self._json({"name": name, "status": status, "output": output})
+            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "status":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            output = tmux_capture(name, lines=40)
+            status = _detect_status(output)
+            self._json({"name": name, "status": status})
+            return
+
+        if path == "/api/tasks":
+            rows = _rows_list(conn.execute("SELECT * FROM tasks ORDER BY created_at").fetchall())
+            self._json(rows)
+            return
+
+        if path == "/api/memory":
+            rows = _rows_list(conn.execute("SELECT * FROM memory ORDER BY key").fetchall())
+            self._json(rows)
+            return
+
+        if path == "/api/messages":
+            rows = _rows_list(conn.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 200").fetchall())
+            self._json(rows)
+            return
+
+        if path == "/api/alerts":
+            rows = _rows_list(conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 100").fetchall())
+            self._json(rows)
+            return
+
+        self._json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        path, parts = self._route()
+        conn = _db()
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "start":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            ns = argparse.Namespace(name=name, prompt=None)
+            result = cmd_start(ns)
+            self._json(result)
+            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "stop":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            ns = argparse.Namespace(name=name)
+            result = cmd_stop(ns)
+            self._json(result)
+            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "send":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            body = self._read_body()
+            text = body.get("text", "")
+            if not text:
+                self._json({"error": "missing text"}, 400)
+                return
+            ns = argparse.Namespace(name=name, text=text)
+            result = cmd_send(ns)
+            self._json(result)
+            return
+
+        if path == "/api/tasks":
+            body = self._read_body()
+            title = body.get("title", "")
+            if not title:
+                self._json({"error": "missing title"}, 400)
+                return
+            tid = _short_id()
+            now = _now()
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (tid, title, "todo", now, now),
+            )
+            conn.commit()
+            self._json({"id": tid, "title": title, "status": "todo"})
+            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "tasks" and parts[3] == "claim":
+            tid = parts[2]
+            body = self._read_body()
+            assignee = body.get("assignee", "web")
+            now = _now()
+            conn.execute(
+                "UPDATE tasks SET status='claimed', assignee=?, updated_at=? WHERE id=?",
+                (assignee, now, tid),
+            )
+            conn.commit()
+            self._json({"id": tid, "status": "claimed"})
+            return
+
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "tasks" and parts[3] == "done":
+            tid = parts[2]
+            now = _now()
+            conn.execute(
+                "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
+                (now, tid),
+            )
+            conn.commit()
+            self._json({"id": tid, "status": "done"})
+            return
+
+        if path == "/api/memory":
+            body = self._read_body()
+            key = body.get("key", "")
+            value = body.get("value", "")
+            if not key:
+                self._json({"error": "missing key"}, 400)
+                return
+            now = _now()
+            conn.execute(
+                """INSERT INTO memory (key, value, updated_at) VALUES (?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (key, value, now),
+            )
+            conn.commit()
+            self._json({"key": key, "value": value})
+            return
+
+        self._json({"error": "not found"}, 404)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        path, parts = self._route()
+        conn = _db()
+
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "sessions":
+            name = parts[2]
+            try:
+                name = resolve_name(name)
+            except SystemExit:
+                self._json({"error": "not found"}, 404)
+                return
+            tmux_kill_session(name)
+            conn.execute("DELETE FROM sessions WHERE name = ?", (name,))
+            conn.commit()
+            self._json({"deleted": name})
+            return
+
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "memory":
+            key = parts[2]
+            conn.execute("DELETE FROM memory WHERE key = ?", (key,))
+            conn.commit()
+            self._json({"deleted": key})
+            return
+
+        self._json({"error": "not found"}, 404)
+
+
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+
+
+def ensure_tls(cert_dir: Path) -> tuple[str, str] | None:
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_file = cert_dir / "cert.pem"
+    key_file = cert_dir / "key.pem"
+
+    if cert_file.exists() and key_file.exists():
+        return str(cert_file), str(key_file)
+
+    try:
+        subprocess.run(
+            [
+                "mkcert",
+                "-cert-file",
+                str(cert_file),
+                "-key-file",
+                str(key_file),
+                "localhost",
+                "127.0.0.1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return str(cert_file), str(key_file)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(key_file),
+                "-out",
+                str(cert_file),
+                "-days",
+                "365",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return str(cert_file), str(key_file)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        LOG.warning("Could not generate TLS certificates; running without TLS")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# cmd_serve
+# ---------------------------------------------------------------------------
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    port = getattr(args, "port", DEFAULT_PORT) or DEFAULT_PORT
+    use_tls = getattr(args, "tls", False)
+
+    _db()
+
+    wd = threading.Thread(target=watchdog_loop, daemon=True)
+    wd.start()
+
+    server = HTTPServer(("0.0.0.0", port), APIHandler)
+
+    scheme = "http"
+    if use_tls:
+        tls = ensure_tls(DATA_DIR / "tls")
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(tls[0], tls[1])
+            server.socket = ctx.wrap_socket(server.socket, server_side=True)
+            scheme = "https"
+
+    banner = (
+        f"\n  codexmux v{VERSION}\n"
+        f"  Dashboard: {scheme}://localhost:{port}/\n"
+        f"  API:       {scheme}://localhost:{port}/api/sessions\n"
+        f"  Watchdog:  running\n"
+    )
+    print(banner)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codexmux",
+        description="Codex CLI Multiplexer",
+    )
+    parser.add_argument("--version", action="version", version=f"codexmux {VERSION}")
+    sub = parser.add_subparsers(dest="command")
+
+    # register
+    p_reg = sub.add_parser("register", help="Register a session")
+    p_reg.add_argument("name")
+    p_reg.add_argument("--dir", default=None)
+    p_reg.add_argument("--full-auto", action="store_true")
+    p_reg.add_argument("--model", default=None)
+    p_reg.add_argument("--sandbox", default=None)
+
+    # start
+    p_start = sub.add_parser("start", help="Start a session")
+    p_start.add_argument("name")
+    p_start.add_argument("--prompt", default=None)
+
+    # stop
+    p_stop = sub.add_parser("stop", help="Stop a session")
+    p_stop.add_argument("name")
+
+    # attach
+    p_attach = sub.add_parser("attach", help="Attach to a session")
+    p_attach.add_argument("name")
+
+    # peek
+    p_peek = sub.add_parser("peek", help="Peek at session output")
+    p_peek.add_argument("name")
+    p_peek.add_argument("--json", dest="json_output", action="store_true")
+
+    # send
+    p_send = sub.add_parser("send", help="Send text to a session")
+    p_send.add_argument("name")
+    p_send.add_argument("text")
+
+    # exec
+    p_exec = sub.add_parser("exec", help="Register + start + send in one shot")
+    p_exec.add_argument("name")
+    p_exec.add_argument("--dir", default=None)
+    p_exec.add_argument("--full-auto", action="store_true")
+    p_exec.add_argument("--model", default=None)
+    p_exec.add_argument("--sandbox", default=None)
+    p_exec.add_argument("--prompt", default=None)
+
+    # ls
+    p_ls = sub.add_parser("ls", help="List sessions")
+    p_ls.add_argument("--format", choices=["text", "json"], default="text")
+
+    # board
+    p_board = sub.add_parser("board", help="Task board")
+    board_sub = p_board.add_subparsers(dest="board_action")
+
+    p_ba = board_sub.add_parser("add", help="Add a task")
+    p_ba.add_argument("title")
+
+    p_bc = board_sub.add_parser("claim", help="Claim a task")
+    p_bc.add_argument("id")
+    p_bc.add_argument("--assignee", default="cli")
+
+    p_bd = board_sub.add_parser("done", help="Mark task done")
+    p_bd.add_argument("id")
+
+    board_sub.add_parser("list", help="List tasks")
+
+    # serve
+    p_serve = sub.add_parser("serve", help="Start the web server")
+    p_serve.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_serve.add_argument("--tls", action="store_true")
+
+    return parser
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        raise SystemExit(1)
+
+    dispatch = {
+        "register": cmd_register,
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "attach": cmd_attach,
+        "peek": cmd_peek,
+        "send": cmd_send,
+        "exec": cmd_exec,
+        "ls": cmd_ls,
+        "board": cmd_board,
+        "serve": cmd_serve,
+    }
+
+    fn = dispatch.get(args.command)
+    if fn is None:
+        parser.print_help()
+        raise SystemExit(1)
+
+    fn(args)
+
+
+if __name__ == "__main__":
+    main()
