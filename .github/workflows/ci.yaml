@@ -61,6 +61,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install test dependencies
+        run: pip install pytest
+
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
 
